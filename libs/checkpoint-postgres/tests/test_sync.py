@@ -1,7 +1,10 @@
 # type: ignore
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Event
+from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 
@@ -15,7 +18,8 @@ from langgraph.checkpoint.base import (
     empty_checkpoint,
 )
 from langgraph.checkpoint.serde.types import TASKS
-from psycopg import Connection
+from psycopg import Connection, IsolationLevel
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -123,8 +127,10 @@ def _shallow_saver():
 
 @contextmanager
 def _saver(name: str):
-    if name == "base":
+    if name in ("base", "fallback"):
         with _base_saver() as saver:
+            if name == "fallback":
+                saver.supports_pipeline = False
             yield saver
     elif name == "shallow":
         with _shallow_saver() as saver:
@@ -258,7 +264,7 @@ def test_search(saver_name: str, test_data) -> None:
         } == {"", "inner"}
 
 
-@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "shallow"])
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "fallback"])
 def test_delete_thread_ignores_late_writes(saver_name: str) -> None:
     with _saver(saver_name) as saver:
         config: RunnableConfig = {
@@ -276,6 +282,261 @@ def test_delete_thread_ignores_late_writes(saver_name: str) -> None:
 
         assert saver.get_tuple({"configurable": {"thread_id": "thread-delete"}}) is None
         assert list(saver.list({"configurable": {"thread_id": "thread-delete"}})) == []
+
+
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "fallback"])
+@pytest.mark.parametrize("operation", ["put", "put_writes"])
+def test_delete_thread_waits_for_inflight_writes(
+    saver_name: str, operation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _saver(saver_name) as saver:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"ch": ["value"]}
+        checkpoint["channel_versions"] = {"ch": "1"}
+        for namespace in ("", "inner"):
+            stored = saver.put(
+                {
+                    "configurable": {
+                        "thread_id": "thread-delete",
+                        "checkpoint_ns": namespace,
+                    }
+                },
+                checkpoint,
+                {},
+                {"ch": "1"},
+            )
+            saver.put_writes(stored, [("ch", "initial")], "initial")
+
+        with saver._cursor() as cur:
+            conninfo = DEFAULT_POSTGRES_URI + cur.connection.info.dbname
+
+        checked, resume = Event(), Event()
+        writer_pid = []
+        original_cursor = saver._cursor
+
+        class PausedCursor:
+            def __init__(self, cur):
+                self.cur = cur
+
+            def __getattr__(self, name):
+                return getattr(self.cur, name)
+
+            def fetchone(self):
+                row = self.cur.fetchone()
+                # Pause after the tombstone lookup, before any data is written.
+                if not checked.is_set():
+                    writer_pid.append(self.cur.connection.info.backend_pid)
+                    checked.set()
+                    assert resume.wait(10)
+                return row
+
+        @contextmanager
+        def paused_cursor(*, pipeline=False):
+            with original_cursor(pipeline=pipeline) as cur:
+                yield PausedCursor(cur)
+
+        monkeypatch.setattr(saver, "_cursor", paused_cursor)
+        with (
+            Connection.connect(
+                conninfo, autocommit=True, row_factory=dict_row
+            ) as delete_conn,
+            Connection.connect(
+                conninfo, autocommit=True, row_factory=dict_row
+            ) as observer,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            delete_conn.execute("SET statement_timeout = '10s'")
+            observer.execute("SET statement_timeout = '10s'")
+            deleter = PostgresSaver(delete_conn)
+            writer = executor.submit(
+                saver.put if operation == "put" else saver.put_writes,
+                *(
+                    (stored, checkpoint, {}, {"ch": "1"})
+                    if operation == "put"
+                    else (stored, [("ch", "inflight")], "inflight")
+                ),
+            )
+            try:
+                assert checked.wait(10)
+                deletion = executor.submit(deleter.delete_thread, "thread-delete")
+                deadline = monotonic() + 10
+                while not observer.execute(
+                    "SELECT %s = ANY(pg_blocking_pids(%s)) AS blocked",
+                    (writer_pid[0], delete_conn.info.backend_pid),
+                ).fetchone()["blocked"]:
+                    assert not deletion.done(), (
+                        "Deletion did not wait for the in-flight write"
+                    )
+                    assert monotonic() < deadline, (
+                        "Deletion did not acquire a database lock"
+                    )
+                    sleep(0.01)
+
+                # A different thread must remain writable while deletion is waiting.
+                other_saver = PostgresSaver(observer)
+                other = other_saver.put(
+                    {
+                        "configurable": {
+                            "thread_id": "thread-other",
+                            "checkpoint_ns": "",
+                        }
+                    },
+                    checkpoint,
+                    {},
+                    {"ch": "1"},
+                )
+                other_saver.put_writes(other, [("ch", "keep")], "keep")
+            finally:
+                resume.set()
+            writer.result(timeout=10)
+            deletion.result(timeout=10)
+            monkeypatch.setattr(saver, "_cursor", original_cursor)
+
+            # Tombstones must also suppress later writes from a different saver.
+            deleter.put(stored, checkpoint, {}, {"ch": "1"})
+            deleter.put_writes(stored, [("ch", "late")], "late")
+            assert saver.get_tuple(stored) is None
+            assert (
+                list(saver.list({"configurable": {"thread_id": "thread-delete"}})) == []
+            )
+            assert other_saver.get_tuple(other).pending_writes == [
+                ("keep", "ch", "keep")
+            ]
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert (
+                    observer.execute(
+                        f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                        ("thread-delete",),
+                    ).fetchone()["count"]
+                    == 0
+                )
+                assert (
+                    observer.execute(
+                        f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                        ("thread-other",),
+                    ).fetchone()["count"]
+                    == 1
+                )
+
+
+@pytest.mark.parametrize(
+    ("saver_name", "thread_row_exists"),
+    [("base", True), ("base", False), ("pipe", True), ("fallback", True)],
+)
+@pytest.mark.parametrize(
+    "isolation_level", [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE]
+)
+@pytest.mark.parametrize("operation", ["put", "put_writes", "delete_thread"])
+def test_delete_thread_rejects_stale_snapshot(
+    saver_name: str,
+    thread_row_exists: bool,
+    isolation_level: IsolationLevel,
+    operation: str,
+) -> None:
+    with _saver(saver_name) as saver:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"ch": ["initial"]}
+        checkpoint["channel_versions"] = {"ch": "1"}
+        stored = saver.put(
+            {"configurable": {"thread_id": "thread-delete", "checkpoint_ns": ""}},
+            checkpoint,
+            {},
+            {"ch": "1"},
+        )
+        saver.put_writes(stored, [("ch", "initial")], "initial")
+        conn = saver.conn
+        with Connection.connect(
+            DEFAULT_POSTGRES_URI + conn.info.dbname,
+            autocommit=True,
+            row_factory=dict_row,
+        ) as peer_conn:
+            peer = PostgresSaver(peer_conn)
+            if not thread_row_exists:
+                # Existing data may predate the per-thread coordination table.
+                peer_conn.execute(
+                    "DELETE FROM checkpoint_threads WHERE thread_id = %s",
+                    ("thread-delete",),
+                )
+
+            # New keys avoid unrelated conflicts on existing checkpoint data.
+            checkpoint = empty_checkpoint()
+            checkpoint["channel_values"] = {"ch": ["new"]}
+            checkpoint["channel_versions"] = {"ch": "2"}
+
+            def mutate():
+                if operation == "put":
+                    saver.put(stored, checkpoint, {}, {"ch": "2"})
+                elif operation == "put_writes":
+                    saver.put_writes(stored, [("ch", "new")], "new")
+                else:
+                    saver.delete_thread("thread-delete")
+
+            conn.isolation_level = isolation_level
+            with pytest.raises(SerializationFailure):
+                with conn.transaction():
+                    conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()
+                    if operation == "delete_thread":
+                        new = peer.put(stored, checkpoint, {}, {"ch": "2"})
+                        peer.put_writes(new, [("ch", "new")], "new")
+                    else:
+                        peer.delete_thread("thread-delete")
+                    mutate()
+
+            # The caller retries the whole transaction with a fresh snapshot.
+            with conn.transaction():
+                mutate()
+
+            assert saver.get_tuple(stored) is None
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert (
+                    peer_conn.execute(
+                        f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                        ("thread-delete",),
+                    ).fetchone()["count"]
+                    == 0
+                )
+
+
+def test_thread_coordination_migration_preserves_data() -> None:
+    with _saver("base") as saver:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"ch": ["keep"]}
+        checkpoint["channel_versions"] = {"ch": "1"}
+        live = saver.put(
+            {"configurable": {"thread_id": "thread-live", "checkpoint_ns": ""}},
+            checkpoint,
+            {},
+            {"ch": "1"},
+        )
+        saver.put_writes(live, [("ch", "keep")], "keep")
+        deleted = saver.put(
+            {"configurable": {"thread_id": "thread-deleted", "checkpoint_ns": ""}},
+            checkpoint,
+            {},
+            {"ch": "1"},
+        )
+        saver.delete_thread("thread-deleted")
+        before = saver.get_tuple(live)
+
+        # Recreate the prior schema without losing checkpoints or tombstones.
+        saver.conn.execute("DROP TABLE checkpoint_threads")
+        saver.conn.execute(
+            "DELETE FROM checkpoint_migrations WHERE v = %s",
+            (len(saver.MIGRATIONS) - 1,),
+        )
+        saver.setup()
+        saver.setup()
+
+        assert saver.get_tuple(live) == before
+        saver.put(deleted, empty_checkpoint(), {}, {})
+        saver.put_writes(deleted, [("ch", "late")], "late")
+        assert saver.get_tuple(deleted) is None
+        assert saver.conn.execute(
+            "SELECT thread_id FROM checkpoint_deleted_threads"
+        ).fetchall() == [{"thread_id": "thread-deleted"}]
+        assert saver.conn.execute(
+            "SELECT COUNT(*) AS count FROM checkpoint_migrations"
+        ).fetchone()["count"] == len(saver.MIGRATIONS)
 
 
 @pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "shallow"])

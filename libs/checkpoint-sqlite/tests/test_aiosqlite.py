@@ -1,6 +1,9 @@
+from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
+import aiosqlite
 import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -190,23 +193,107 @@ class TestAsyncSqliteSaver:
             results = [c async for c in saver.alist(None, limit=None)]
             assert len(results) == 5
 
-    async def test_delete_thread_ignores_late_writes(self) -> None:
-        async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
-            config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": "thread-delete",
-                    "checkpoint_ns": "",
+    @pytest.mark.parametrize("thread_id", ["thread-delete", 42, UUID(int=1)])
+    async def test_delete_thread_ignores_late_writes(
+        self, tmp_path: Path, thread_id: str | int | UUID
+    ) -> None:
+        path = str(tmp_path / "checkpoints.sqlite")
+        configs = []
+        async with AsyncSqliteSaver.from_conn_string(path) as saver:
+            for namespace in ("", "child"):
+                config: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "checkpoint_ns": namespace,
+                    }
                 }
-            }
+                stored = await saver.aput(config, empty_checkpoint(), {}, {})
+                await saver.aput_writes(stored, [("ch", "before-delete")], "task")
+                configs.append(stored)
+            other = await saver.aput(self.config_1, empty_checkpoint(), {}, {})
+            await saver.aput_writes(other, [("ch", "preserved")], "task")
 
-            stored = await saver.aput(config, empty_checkpoint(), {}, {})
-            await saver.adelete_thread("thread-delete")
+            await saver.adelete_thread(str(thread_id))
+            await saver.adelete_thread(str(thread_id))
 
-            await saver.aput(stored, empty_checkpoint(), {"step": 99}, {})
-            await saver.aput_writes(stored, [("ch", "late-write")], str(uuid4()))
+        # Tombstones must also protect writes made by a new saver connection.
+        async with AsyncSqliteSaver.from_conn_string(path) as saver:
+            for config in configs:
+                checkpoint = empty_checkpoint()
+                returned = await saver.aput(config, checkpoint, {"step": 99}, {})
+                assert returned["configurable"]["checkpoint_id"] == checkpoint["id"]
+                await saver.aput_writes(config, [("ch", "late-write")], "task")
+                await saver.aput_writes(config, [("__error__", "late-error")], "task")
+                assert await saver.aget_tuple(config) is None
 
-            assert await saver.aget_tuple({"configurable": {"thread_id": "thread-delete"}}) is None
             assert [
                 item
-                async for item in saver.alist({"configurable": {"thread_id": "thread-delete"}})
+                async for item in saver.alist(
+                    {"configurable": {"thread_id": str(thread_id)}}
+                )
             ] == []
+            async with saver.conn.execute(
+                "SELECT COUNT(*) FROM writes WHERE thread_id = ?", (str(thread_id),)
+            ) as cur:
+                assert await cur.fetchone() == (0,)
+            kept = await saver.aget_tuple(other)
+            assert kept is not None
+            assert kept.pending_writes == [("task", "ch", "preserved")]
+
+    @pytest.mark.parametrize("operation", ["put", "put_writes", "put_error"])
+    async def test_delete_thread_during_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+    ) -> None:
+        path = str(tmp_path / "checkpoints.sqlite")
+        async with (
+            AsyncSqliteSaver.from_conn_string(path) as saver,
+            AsyncSqliteSaver.from_conn_string(path) as deleter,
+        ):
+            stored = await saver.aput(self.config_1, empty_checkpoint(), {}, {})
+            await deleter.setup()
+            interleaved = False
+
+            async def delete_before_insert(sql: str) -> None:
+                nonlocal interleaved
+                if sql.startswith(
+                    (
+                        "INSERT OR REPLACE INTO checkpoints",
+                        "INSERT OR REPLACE INTO writes",
+                        "INSERT OR IGNORE INTO writes",
+                    )
+                ):
+                    interleaved = True
+                    await deleter.adelete_thread("thread-1")
+
+            original_execute = aiosqlite.Cursor.execute
+            original_executemany = aiosqlite.Cursor.executemany
+
+            async def execute(
+                cur: aiosqlite.Cursor, sql: str, parameters: Iterable[Any] | None = None
+            ) -> aiosqlite.Cursor:
+                await delete_before_insert(sql)
+                return await original_execute(cur, sql, parameters)
+
+            async def executemany(
+                cur: aiosqlite.Cursor, sql: str, parameters: Iterable[Sequence[Any]]
+            ) -> aiosqlite.Cursor:
+                await delete_before_insert(sql)
+                return await original_executemany(cur, sql, parameters)
+
+            monkeypatch.setattr(aiosqlite.Cursor, "execute", execute)
+            monkeypatch.setattr(aiosqlite.Cursor, "executemany", executemany)
+
+            # Complete deletion immediately before the actual INSERT, after any
+            # separate tombstone read a writer may have performed.
+            if operation == "put":
+                await saver.aput(stored, empty_checkpoint(), {}, {})
+            else:
+                channel = "__error__" if operation == "put_error" else "ch"
+                await saver.aput_writes(stored, [(channel, "late-write")], "task")
+
+            assert interleaved
+            config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
+            assert await saver.aget_tuple(config) is None
+            assert [item async for item in saver.alist(config)] == []
+            async with saver.conn.execute("SELECT COUNT(*) FROM writes") as cur:
+                assert await cur.fetchone() == (0,)

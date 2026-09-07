@@ -1,5 +1,9 @@
+import sqlite3
+from collections.abc import Iterable
+from contextlib import closing
+from pathlib import Path
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -199,23 +203,100 @@ class TestSqliteSaver:
             with pytest.raises(ValueError, match="Invalid filter key"):
                 _metadata_predicate({malicious_key: "dummy"})
 
-    def test_delete_thread_ignores_late_writes(self) -> None:
-        with SqliteSaver.from_conn_string(":memory:") as saver:
-            config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": "thread-delete",
-                    "checkpoint_ns": "",
+    @pytest.mark.parametrize("thread_id", ["thread-delete", 42, UUID(int=1)])
+    def test_delete_thread_ignores_late_writes(
+        self, tmp_path: Path, thread_id: str | int | UUID
+    ) -> None:
+        path = str(tmp_path / "checkpoints.sqlite")
+        configs = []
+        with SqliteSaver.from_conn_string(path) as saver:
+            for namespace in ("", "child"):
+                config: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "checkpoint_ns": namespace,
+                    }
                 }
-            }
+                stored = saver.put(config, empty_checkpoint(), {}, {})
+                saver.put_writes(stored, [("ch", "before-delete")], "task")
+                configs.append(stored)
+            other = saver.put(self.config_1, empty_checkpoint(), {}, {})
+            saver.put_writes(other, [("ch", "preserved")], "task")
 
-            stored = saver.put(config, empty_checkpoint(), {}, {})
-            saver.delete_thread("thread-delete")
+            saver.delete_thread(str(thread_id))
+            saver.delete_thread(str(thread_id))
 
-            saver.put(stored, empty_checkpoint(), {"step": 99}, {})
-            saver.put_writes(stored, [("ch", "late-write")], str(uuid4()))
+        # Tombstones must also protect writes made by a new saver connection.
+        with SqliteSaver.from_conn_string(path) as saver:
+            for config in configs:
+                checkpoint = empty_checkpoint()
+                returned = saver.put(config, checkpoint, {"step": 99}, {})
+                assert returned["configurable"]["checkpoint_id"] == checkpoint["id"]
+                saver.put_writes(config, [("ch", "late-write")], "task")
+                saver.put_writes(config, [("__error__", "late-error")], "task")
+                assert saver.get_tuple(config) is None
 
-            assert saver.get_tuple({"configurable": {"thread_id": "thread-delete"}}) is None
-            assert list(saver.list({"configurable": {"thread_id": "thread-delete"}})) == []
+            assert (
+                list(saver.list({"configurable": {"thread_id": str(thread_id)}})) == []
+            )
+            assert saver.conn.execute(
+                "SELECT COUNT(*) FROM writes WHERE thread_id = ?", (str(thread_id),)
+            ).fetchone() == (0,)
+            kept = saver.get_tuple(other)
+            assert kept is not None
+            assert kept.pending_writes == [("task", "ch", "preserved")]
+
+    @pytest.mark.parametrize("operation", ["put", "put_writes", "put_error"])
+    def test_delete_thread_during_write(self, tmp_path: Path, operation: str) -> None:
+        path = str(tmp_path / "checkpoints.sqlite")
+        with SqliteSaver.from_conn_string(path) as deleter:
+            stored = deleter.put(self.config_1, empty_checkpoint(), {}, {})
+            interleaved = False
+
+            def delete_before_insert(sql: str) -> None:
+                nonlocal interleaved
+                if sql.startswith(
+                    (
+                        "INSERT OR REPLACE INTO checkpoints",
+                        "INSERT OR REPLACE INTO writes",
+                        "INSERT OR IGNORE INTO writes",
+                    )
+                ):
+                    interleaved = True
+                    deleter.delete_thread("thread-1")
+
+            class InterleavedCursor(sqlite3.Cursor):
+                def execute(
+                    self, sql: str, parameters: Any = ()
+                ) -> "InterleavedCursor":
+                    delete_before_insert(sql)
+                    return super().execute(sql, parameters)
+
+                def executemany(
+                    self, sql: str, parameters: Iterable[Any]
+                ) -> "InterleavedCursor":
+                    delete_before_insert(sql)
+                    return super().executemany(sql, parameters)
+
+            class InterleavedConnection(sqlite3.Connection):
+                def cursor(self, factory: Any = InterleavedCursor) -> Any:
+                    return super().cursor(factory)
+
+            with closing(sqlite3.connect(path, factory=InterleavedConnection)) as conn:
+                saver = SqliteSaver(conn)
+                # Complete deletion immediately before the actual INSERT, after any
+                # separate tombstone read a writer may have performed.
+                if operation == "put":
+                    saver.put(stored, empty_checkpoint(), {}, {})
+                else:
+                    channel = "__error__" if operation == "put_error" else "ch"
+                    saver.put_writes(stored, [(channel, "late-write")], "task")
+
+                assert interleaved
+                config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
+                assert saver.get_tuple(config) is None
+                assert list(saver.list(config)) == []
+                assert conn.execute("SELECT COUNT(*) FROM writes").fetchone() == (0,)
 
     def test_checkpoint_search_sql_injection_prevention(self) -> None:
         """Test that SQL injection via malicious filter keys is prevented in checkpoint search."""

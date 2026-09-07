@@ -5,7 +5,7 @@
 ######################
 
 start-postgres:
-	POSTGRES_VERSION=${POSTGRES_VERSION:-16} docker compose -f tests/compose-postgres.yml up -V --force-recreate --wait || ( \
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-16} docker compose -f tests/compose-postgres.yml up -V --force-recreate --wait || ( \
 		echo "Failed to start PostgreSQL, printing logs..."; \
 		docker compose -f tests/compose-postgres.yml logs; \
 		exit 1 \
@@ -18,8 +18,8 @@ POSTGRES_VERSIONS ?= 15 16
 test_pg_version:
 	@echo "Testing PostgreSQL $(POSTGRES_VERSION)"
 	@POSTGRES_VERSION=$(POSTGRES_VERSION) make start-postgres
-	@uv run pytest $(TEST)
-	@EXIT_CODE=$$?; \
+	@uv run pytest $(TEST); \
+	EXIT_CODE=$$?; \
 	make stop-postgres; \
 	echo "Finished testing PostgreSQL $(POSTGRES_VERSION); Exit code: $$EXIT_CODE"; \
 	exit $$EXIT_CODE
@@ -35,7 +35,7 @@ test:
 
 TEST ?= .
 test_watch:
-	POSTGRES_VERSION=${POSTGRES_VERSION:-16} make start-postgres; \
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-16} make start-postgres; \
 	uv run ptw $(TEST); \
 	EXIT_CODE=$$?; \
 	make stop-postgres; \
