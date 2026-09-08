@@ -307,7 +307,7 @@ class PostgresSaver(BasePostgresSaver):
             else:
                 blob_values[k] = copy["channel_values"].pop(k)
 
-        with self._cursor(pipeline=True) as cur:
+        with self._write_cursor(thread_id) as cur:
             cur.execute(
                 self.CHECK_CHECKPOINT_DELETED_THREAD_SQL,
                 (thread_id,),
@@ -360,7 +360,7 @@ class PostgresSaver(BasePostgresSaver):
             if all(w[0] in WRITES_IDX_MAP for w in writes)
             else self.INSERT_CHECKPOINT_WRITES_SQL
         )
-        with self._cursor(pipeline=True) as cur:
+        with self._write_cursor(config["configurable"]["thread_id"]) as cur:
             cur.execute(
                 self.CHECK_CHECKPOINT_DELETED_THREAD_SQL,
                 (config["configurable"]["thread_id"],),
@@ -382,13 +382,16 @@ class PostgresSaver(BasePostgresSaver):
     def delete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
 
+        The thread ID remains deleted: subsequent checkpoints and writes are ignored.
+        Retry the caller's transaction if PostgreSQL raises a serialization failure.
+
         Args:
             thread_id: The thread ID to delete.
 
         Returns:
             None
         """
-        with self._cursor(pipeline=True) as cur:
+        with self._write_cursor(thread_id) as cur:
             cur.execute(
                 self.INSERT_CHECKPOINT_DELETED_THREAD_SQL,
                 (str(thread_id),),
@@ -405,6 +408,16 @@ class PostgresSaver(BasePostgresSaver):
                 "DELETE FROM checkpoint_writes WHERE thread_id = %s",
                 (str(thread_id),),
             )
+
+    @contextmanager
+    def _write_cursor(self, thread_id: str) -> Iterator[Cursor[DictRow]]:
+        # Update the coordination row so stale snapshots fail before modifying data.
+        with self._cursor(pipeline=True) as cur, cur.connection.transaction():
+            cur.execute(
+                self.UPSERT_CHECKPOINT_THREADS_SQL,
+                (str(thread_id),),
+            )
+            yield cur
 
     @contextmanager
     def _cursor(self, *, pipeline: bool = False) -> Iterator[Cursor[DictRow]]:

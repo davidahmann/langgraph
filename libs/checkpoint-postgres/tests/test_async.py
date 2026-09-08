@@ -1,6 +1,8 @@
 # type: ignore
 
+import asyncio
 from contextlib import asynccontextmanager
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -14,7 +16,8 @@ from langgraph.checkpoint.base import (
     empty_checkpoint,
 )
 from langgraph.checkpoint.serde.types import TASKS
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, IsolationLevel
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -141,8 +144,10 @@ async def _shallow_saver():
 
 @asynccontextmanager
 async def _saver(name: str):
-    if name == "base":
+    if name in ("base", "fallback"):
         async with _base_saver() as saver:
+            if name == "fallback":
+                saver.supports_pipeline = False
             yield saver
     elif name == "shallow":
         async with _shallow_saver() as saver:
@@ -278,7 +283,7 @@ async def test_asearch(saver_name: str, test_data) -> None:
         } == {"", "inner"}
 
 
-@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "shallow"])
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "fallback"])
 async def test_delete_thread_ignores_late_writes(saver_name: str) -> None:
     async with _saver(saver_name) as saver:
         config: RunnableConfig = {
@@ -294,10 +299,236 @@ async def test_delete_thread_ignores_late_writes(saver_name: str) -> None:
         await saver.aput(stored, empty_checkpoint(), {"step": 99}, {})
         await saver.aput_writes(stored, [("ch", "late-write")], str(uuid4()))
 
-        assert await saver.aget_tuple({"configurable": {"thread_id": "thread-delete"}}) is None
+        assert (
+            await saver.aget_tuple({"configurable": {"thread_id": "thread-delete"}})
+            is None
+        )
         assert [
-            c async for c in saver.alist({"configurable": {"thread_id": "thread-delete"}})
+            c
+            async for c in saver.alist({"configurable": {"thread_id": "thread-delete"}})
         ] == []
+
+
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "fallback"])
+@pytest.mark.parametrize("operation", ["put", "put_writes"])
+async def test_delete_thread_waits_for_inflight_writes(
+    saver_name: str, operation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _saver(saver_name) as saver:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"ch": ["value"]}
+        checkpoint["channel_versions"] = {"ch": "1"}
+        for namespace in ("", "inner"):
+            stored = await saver.aput(
+                {
+                    "configurable": {
+                        "thread_id": "thread-delete",
+                        "checkpoint_ns": namespace,
+                    }
+                },
+                checkpoint,
+                {},
+                {"ch": "1"},
+            )
+            await saver.aput_writes(stored, [("ch", "initial")], "initial")
+
+        async with saver._cursor() as cur:
+            conninfo = DEFAULT_POSTGRES_URI + cur.connection.info.dbname
+
+        checked, resume = asyncio.Event(), asyncio.Event()
+        writer_pid = []
+        original_cursor = saver._cursor
+
+        class PausedCursor:
+            def __init__(self, cur):
+                self.cur = cur
+
+            def __getattr__(self, name):
+                return getattr(self.cur, name)
+
+            async def fetchone(self):
+                row = await self.cur.fetchone()
+                # Pause after the tombstone lookup, before any data is written.
+                if not checked.is_set():
+                    writer_pid.append(self.cur.connection.info.backend_pid)
+                    checked.set()
+                    await asyncio.wait_for(resume.wait(), 10)
+                return row
+
+        @asynccontextmanager
+        async def paused_cursor(*, pipeline=False):
+            async with original_cursor(pipeline=pipeline) as cur:
+                yield PausedCursor(cur)
+
+        monkeypatch.setattr(saver, "_cursor", paused_cursor)
+        async with (
+            await AsyncConnection.connect(
+                conninfo, autocommit=True, row_factory=dict_row
+            ) as delete_conn,
+            await AsyncConnection.connect(
+                conninfo, autocommit=True, row_factory=dict_row
+            ) as observer,
+        ):
+            await delete_conn.execute("SET statement_timeout = '10s'")
+            await observer.execute("SET statement_timeout = '10s'")
+            deleter = AsyncPostgresSaver(delete_conn)
+            writer = asyncio.create_task(
+                saver.aput(stored, checkpoint, {}, {"ch": "1"})
+                if operation == "put"
+                else saver.aput_writes(stored, [("ch", "inflight")], "inflight")
+            )
+            tasks = [writer]
+            try:
+                await asyncio.wait_for(checked.wait(), 10)
+                deletion = asyncio.create_task(deleter.adelete_thread("thread-delete"))
+                tasks.append(deletion)
+                deadline = monotonic() + 10
+                while not (
+                    await (
+                        await observer.execute(
+                            "SELECT %s = ANY(pg_blocking_pids(%s)) AS blocked",
+                            (writer_pid[0], delete_conn.info.backend_pid),
+                        )
+                    ).fetchone()
+                )["blocked"]:
+                    assert not deletion.done(), (
+                        "Deletion did not wait for the in-flight write"
+                    )
+                    assert monotonic() < deadline, (
+                        "Deletion did not acquire a database lock"
+                    )
+                    await asyncio.sleep(0.01)
+
+                # A different thread must remain writable while deletion is waiting.
+                other_saver = AsyncPostgresSaver(observer)
+                other = await other_saver.aput(
+                    {
+                        "configurable": {
+                            "thread_id": "thread-other",
+                            "checkpoint_ns": "",
+                        }
+                    },
+                    checkpoint,
+                    {},
+                    {"ch": "1"},
+                )
+                await other_saver.aput_writes(other, [("ch", "keep")], "keep")
+            finally:
+                resume.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            monkeypatch.setattr(saver, "_cursor", original_cursor)
+
+            # Tombstones must also suppress later writes from a different saver.
+            await deleter.aput(stored, checkpoint, {}, {"ch": "1"})
+            await deleter.aput_writes(stored, [("ch", "late")], "late")
+            assert await saver.aget_tuple(stored) is None
+            assert [
+                item
+                async for item in saver.alist(
+                    {"configurable": {"thread_id": "thread-delete"}}
+                )
+            ] == []
+            assert (await other_saver.aget_tuple(other)).pending_writes == [
+                ("keep", "ch", "keep")
+            ]
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert (
+                    await (
+                        await observer.execute(
+                            f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                            ("thread-delete",),
+                        )
+                    ).fetchone()
+                )["count"] == 0
+                assert (
+                    await (
+                        await observer.execute(
+                            f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                            ("thread-other",),
+                        )
+                    ).fetchone()
+                )["count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("saver_name", "thread_row_exists"),
+    [("base", True), ("base", False), ("pipe", True), ("fallback", True)],
+)
+@pytest.mark.parametrize(
+    "isolation_level", [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE]
+)
+@pytest.mark.parametrize("operation", ["put", "put_writes", "delete_thread"])
+async def test_delete_thread_rejects_stale_snapshot(
+    saver_name: str,
+    thread_row_exists: bool,
+    isolation_level: IsolationLevel,
+    operation: str,
+) -> None:
+    async with _saver(saver_name) as saver:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"ch": ["initial"]}
+        checkpoint["channel_versions"] = {"ch": "1"}
+        stored = await saver.aput(
+            {"configurable": {"thread_id": "thread-delete", "checkpoint_ns": ""}},
+            checkpoint,
+            {},
+            {"ch": "1"},
+        )
+        await saver.aput_writes(stored, [("ch", "initial")], "initial")
+        conn = saver.conn
+        async with await AsyncConnection.connect(
+            DEFAULT_POSTGRES_URI + conn.info.dbname,
+            autocommit=True,
+            row_factory=dict_row,
+        ) as peer_conn:
+            peer = AsyncPostgresSaver(peer_conn)
+            if not thread_row_exists:
+                # Existing data may predate the per-thread coordination table.
+                await peer_conn.execute(
+                    "DELETE FROM checkpoint_threads WHERE thread_id = %s",
+                    ("thread-delete",),
+                )
+
+            # New keys avoid unrelated conflicts on existing checkpoint data.
+            checkpoint = empty_checkpoint()
+            checkpoint["channel_values"] = {"ch": ["new"]}
+            checkpoint["channel_versions"] = {"ch": "2"}
+
+            async def mutate():
+                if operation == "put":
+                    await saver.aput(stored, checkpoint, {}, {"ch": "2"})
+                elif operation == "put_writes":
+                    await saver.aput_writes(stored, [("ch", "new")], "new")
+                else:
+                    await saver.adelete_thread("thread-delete")
+
+            await conn.set_isolation_level(isolation_level)
+            with pytest.raises(SerializationFailure):
+                async with conn.transaction():
+                    await (
+                        await conn.execute("SELECT COUNT(*) FROM checkpoints")
+                    ).fetchone()
+                    if operation == "delete_thread":
+                        new = await peer.aput(stored, checkpoint, {}, {"ch": "2"})
+                        await peer.aput_writes(new, [("ch", "new")], "new")
+                    else:
+                        await peer.adelete_thread("thread-delete")
+                    await mutate()
+
+            # The caller retries the whole transaction with a fresh snapshot.
+            async with conn.transaction():
+                await mutate()
+
+            assert await saver.aget_tuple(stored) is None
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert (
+                    await (
+                        await peer_conn.execute(
+                            f"SELECT COUNT(*) AS count FROM {table} WHERE thread_id = %s",
+                            ("thread-delete",),
+                        )
+                    ).fetchone()
+                )["count"] == 0
 
 
 @pytest.mark.parametrize("saver_name", ["base", "pool", "pipe", "shallow"])

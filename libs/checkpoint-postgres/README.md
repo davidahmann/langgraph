@@ -2,6 +2,12 @@
 
 Implementation of LangGraph CheckpointSaver that uses Postgres.
 
+Calling `delete_thread()` or `adelete_thread()` permanently deletes a thread across all checkpoint namespaces. Later checkpoints and intermediate writes for that thread ID are ignored, including writes from other saver instances. `put()` and `aput()` still return the updated configuration without saving it; use a new thread ID to start again.
+
+Writes and deletion for the same thread update a shared coordination row inside a transaction. This serializes concurrent mutations and prevents transactions with an older snapshot from recreating deleted data or incompletely deleting newer writes. With `REPEATABLE READ` or `SERIALIZABLE`, a conflicting operation can raise PostgreSQL's `SerializationFailure`; retry the entire caller-managed transaction. Changes become visible and the lock is released when the transaction ends.
+
+Run `.setup()` after upgrading to create the `checkpoint_threads` coordination table. It retains one row per thread ID, including deleted threads, so older transactions can still detect conflicting mutations. Existing checkpoints and deletion tombstones are preserved.
+
 ## Dependencies
 
 By default `langgraph-checkpoint-postgres` installs `psycopg` (Psycopg 3) without any extras. However, you can choose a specific installation that best suits your needs [here](https://www.psycopg.org/psycopg3/docs/basic/install.html) (for example, `psycopg[binary]`).

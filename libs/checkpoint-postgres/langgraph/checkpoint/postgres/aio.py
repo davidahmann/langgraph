@@ -266,7 +266,7 @@ class AsyncPostgresSaver(BasePostgresSaver):
             else:
                 blob_values[k] = copy["channel_values"].pop(k)
 
-        async with self._cursor(pipeline=True) as cur:
+        async with self._write_cursor(thread_id) as cur:
             await cur.execute(
                 self.CHECK_CHECKPOINT_DELETED_THREAD_SQL,
                 (thread_id,),
@@ -329,7 +329,7 @@ class AsyncPostgresSaver(BasePostgresSaver):
             task_path,
             writes,
         )
-        async with self._cursor(pipeline=True) as cur:
+        async with self._write_cursor(config["configurable"]["thread_id"]) as cur:
             await cur.execute(
                 self.CHECK_CHECKPOINT_DELETED_THREAD_SQL,
                 (config["configurable"]["thread_id"],),
@@ -341,13 +341,16 @@ class AsyncPostgresSaver(BasePostgresSaver):
     async def adelete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
 
+        The thread ID remains deleted: subsequent checkpoints and writes are ignored.
+        Retry the caller's transaction if PostgreSQL raises a serialization failure.
+
         Args:
             thread_id: The thread ID to delete.
 
         Returns:
             None
         """
-        async with self._cursor(pipeline=True) as cur:
+        async with self._write_cursor(thread_id) as cur:
             await cur.execute(
                 self.INSERT_CHECKPOINT_DELETED_THREAD_SQL,
                 (str(thread_id),),
@@ -364,6 +367,18 @@ class AsyncPostgresSaver(BasePostgresSaver):
                 "DELETE FROM checkpoint_writes WHERE thread_id = %s",
                 (str(thread_id),),
             )
+
+    @asynccontextmanager
+    async def _write_cursor(
+        self, thread_id: str
+    ) -> AsyncIterator[AsyncCursor[DictRow]]:
+        # Update the coordination row so stale snapshots fail before modifying data.
+        async with self._cursor(pipeline=True) as cur, cur.connection.transaction():
+            await cur.execute(
+                self.UPSERT_CHECKPOINT_THREADS_SQL,
+                (str(thread_id),),
+            )
+            yield cur
 
     @asynccontextmanager
     async def _cursor(
@@ -571,6 +586,9 @@ class AsyncPostgresSaver(BasePostgresSaver):
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
+
+        The thread ID remains deleted: subsequent checkpoints and writes are ignored.
+        Retry the caller's transaction if PostgreSQL raises a serialization failure.
 
         Args:
             thread_id: The thread ID to delete.

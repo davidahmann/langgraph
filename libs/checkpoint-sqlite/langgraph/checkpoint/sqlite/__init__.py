@@ -418,20 +418,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
             get_checkpoint_metadata(config, metadata), ensure_ascii=False
         ).encode("utf-8", "ignore")
         with self.cursor() as cur:
+            # Check the tombstone in the INSERT so another connection cannot
+            # delete the thread between a separate check and the write.
             cur.execute(
-                "SELECT 1 FROM checkpoint_deleted_threads WHERE thread_id = ?",
-                (str(thread_id),),
-            )
-            if cur.fetchone():
-                return {
-                    "configurable": {
-                        "thread_id": thread_id,
-                        "checkpoint_ns": checkpoint_ns,
-                        "checkpoint_id": checkpoint["id"],
-                    }
-                }
-            cur.execute(
-                "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM checkpoint_deleted_threads WHERE thread_id = ?)",
                 (
                     str(config["configurable"]["thread_id"]),
                     checkpoint_ns,
@@ -440,6 +430,7 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                     type_,
                     serialized_checkpoint,
                     serialized_metadata,
+                    str(thread_id),
                 ),
             )
         return {
@@ -468,17 +459,11 @@ class SqliteSaver(BaseCheckpointSaver[str]):
             task_path: Path of the task creating the writes.
         """
         query = (
-            "INSERT OR REPLACE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT OR REPLACE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM checkpoint_deleted_threads WHERE thread_id = ?)"
             if all(w[0] in WRITES_IDX_MAP for w in writes)
-            else "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            else "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM checkpoint_deleted_threads WHERE thread_id = ?)"
         )
         with self.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM checkpoint_deleted_threads WHERE thread_id = ?",
-                (str(config["configurable"]["thread_id"]),),
-            )
-            if cur.fetchone():
-                return
             cur.executemany(
                 query,
                 [
@@ -490,6 +475,7 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                         WRITES_IDX_MAP.get(channel, idx),
                         channel,
                         *self.serde.dumps_typed(value),
+                        str(config["configurable"]["thread_id"]),
                     )
                     for idx, (channel, value) in enumerate(writes)
                 ],
@@ -497,6 +483,11 @@ class SqliteSaver(BaseCheckpointSaver[str]):
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
+
+        The thread ID remains deleted, including across saver connections. Later
+        calls to `put` and `put_writes` for this ID are ignored. `put` still returns
+        the checkpoint configuration without persisting it. Use a new thread ID
+        to start another thread.
 
         Args:
             thread_id: The thread ID to delete.
